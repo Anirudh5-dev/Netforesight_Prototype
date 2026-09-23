@@ -8,6 +8,10 @@ font = "sans serif"
 
 [server]
 headless = true
+# File-uploader limit in MB (Streamlit default is 200).
+# Raised for large PCAP captures; practical ceiling is server RAM since
+# uploads are held in memory during parsing.
+maxUploadSize = 1024
 
 [browser]
 gatherUsageStats = false
