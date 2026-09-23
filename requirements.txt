@@ -1,0 +1,13 @@
+# NetForeSight — core web app and visualization stack
+streamlit>=1.35
+plotly>=5.18
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.3
+
+# World-model placeholder architecture (optional at runtime:
+# the app runs fully offline without torch by using the demo engine)
+torch>=2.0
+
+# PCAP parsing (optional at runtime: CSV + demo data always work offline)
+scapy>=2.5
