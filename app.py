@@ -145,7 +145,8 @@ PIPELINE_LABELS = ["File Loaded", "Feature Extraction", "Normalization",
 
 def run_analysis(df: pd.DataFrame, name: str, ftype: str, size: str,
                  scenario_final: float | None = None,
-                 show_progress: bool = True) -> None:
+                 show_progress: bool = True,
+                 notes: list[str] | None = None) -> None:
     """Execute the offline pipeline and store every artifact in session."""
     steps: list[str] = []
 
@@ -184,7 +185,8 @@ def run_analysis(df: pd.DataFrame, name: str, ftype: str, size: str,
     st.session_state.forecast = forecast
     st.session_state.contributions = contribs
     st.session_state.summary = summarize_flows(feats)
-    st.session_state.dataset_info = describe_dataset(feats, name, ftype, size)
+    st.session_state.dataset_info = describe_dataset(
+        feats, name, ftype, size, notes)
     st.session_state.analysis_steps = steps
     st.session_state.alert_dismissed = False
     st.session_state.show_investigation = False
@@ -202,7 +204,8 @@ def apply_demo_phase(phase: int) -> None:
     phase_spec = scenario_phase(phase)
     windows: list[NetworkWindow] = st.session_state.windows
     if not windows:  # fresh session: load demo first
-        run_analysis(load_demo_dataset(), "demo_network.csv", "CSV",
+        demo_df, _ = load_demo_dataset()
+        run_analysis(demo_df, "demo_network.csv", "CSV",
                      "—", show_progress=False)
         windows = st.session_state.windows
     k = min(int(phase), 4, len(windows))
@@ -225,7 +228,8 @@ def apply_demo_phase(phase: int) -> None:
 
 def ensure_data() -> None:
     if st.session_state.flows is None:
-        run_analysis(load_demo_dataset(), "demo_network.csv", "CSV", "—",
+        demo_df, _ = load_demo_dataset()
+        run_analysis(demo_df, "demo_network.csv", "CSV", "—",
                      show_progress=False)
         st.session_state.is_demo = True
         apply_demo_phase(st.session_state.demo_phase)
@@ -448,8 +452,9 @@ def page_dashboard() -> None:
         up = st.file_uploader("Choose a .pcap / .pcapng file", type=["pcap", "pcapng"])
         if up is not None and st.button("▶ Process PCAP", type="primary"):
             try:
-                df = load_pcap(up)
-                run_analysis(df, up.name, "PCAP", f"{len(up.getvalue())/1024:.1f} KB")
+                df, notes = load_pcap(up)
+                run_analysis(df, up.name, "PCAP", f"{len(up.getvalue())/1024:.1f} KB",
+                             notes=notes)
                 st.session_state.is_demo = False
                 st.session_state.visible_ids = [w.id for w in st.session_state.windows]
                 st.success(f"Processed {len(df):,} flows from {up.name}.")
@@ -460,8 +465,9 @@ def page_dashboard() -> None:
         up = st.file_uploader("Choose a .csv file", type=["csv"])
         if up is not None and st.button("▶ Process CSV", type="primary"):
             try:
-                df = load_uploaded_csv(up)
-                run_analysis(df, up.name, "CSV", f"{up.size/1024:.1f} KB")
+                df, notes = load_uploaded_csv(up)
+                run_analysis(df, up.name, "CSV", f"{up.size/1024:.1f} KB",
+                             notes=notes)
                 st.session_state.is_demo = False
                 st.session_state.visible_ids = [w.id for w in st.session_state.windows]
                 st.success(f"Processed {len(df):,} records from {up.name}.")
@@ -473,7 +479,8 @@ def page_dashboard() -> None:
                     "internal attack (12,481 flows, 5 time windows). "
                     "CICIDS2017 flow CSVs are also supported.")
         if st.button("📥 Load Demo Dataset", type="primary"):
-            run_analysis(load_demo_dataset(), "demo_network.csv", "CSV", "—")
+            demo_df, _ = load_demo_dataset()
+            run_analysis(demo_df, "demo_network.csv", "CSV", "—")
             st.session_state.is_demo = True
             apply_demo_phase(7)
             st.success("Demo dataset loaded.")
@@ -492,11 +499,11 @@ def page_dashboard() -> None:
                     path = DATA_DIR / pick
                     with open(path, "r", newline="",
                               encoding="utf-8", errors="replace") as fh:
-                        df = load_uploaded_csv(fh)
+                        df, notes = load_uploaded_csv(fh)
                     size_mb = path.stat().st_size / (1024 * 1024)
                     size = (f"{size_mb:.1f} MB" if size_mb >= 1
                             else f"{path.stat().st_size / 1024:.1f} KB")
-                    run_analysis(df, pick, "CSV", size)
+                    run_analysis(df, pick, "CSV", size, notes=notes)
                     st.session_state.is_demo = False
                     st.session_state.visible_ids = [
                         w.id for w in st.session_state.windows]
@@ -513,6 +520,8 @@ def page_dashboard() -> None:
         c3.metric("File Size", info.get("file_size", "—"))
         c4.metric("Records / Packets", f"{info.get('records', 0):,}")
         c5.metric("Analysis Status", info.get("status", "—"))
+    for note in info.get("notes", []):
+        st.warning(f"⚠ Data provenance: {note}")
     if st.session_state.analysis_steps:
         st.markdown("**Processing workflow**")
         st.markdown("\n".join(f'<div class="check-line">✓ {s}</div>'
@@ -576,7 +585,8 @@ def page_dashboard() -> None:
                "Prioritize → Review")
     if st.button("▶ Run Demo Scenario", type="primary"):
         if st.session_state.flows is None or not st.session_state.is_demo:
-            run_analysis(load_demo_dataset(), "demo_network.csv", "CSV", "—",
+            demo_df, _ = load_demo_dataset()
+            run_analysis(demo_df, "demo_network.csv", "CSV", "—",
                          show_progress=False)
             st.session_state.is_demo = True
         log: list[str] = []

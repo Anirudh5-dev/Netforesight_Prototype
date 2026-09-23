@@ -206,7 +206,7 @@ def ensure_demo_csv() -> Path:
     return DEMO_CSV
 
 
-def load_demo_dataset() -> pd.DataFrame:
+def load_demo_dataset() -> tuple[pd.DataFrame, list[str]]:
     ensure_demo_csv()
     df = pd.read_csv(DEMO_CSV, parse_dates=["timestamp"])
     if df.empty:
@@ -290,7 +290,8 @@ def _apply_cicids_mapping(out: pd.DataFrame, raw: pd.DataFrame,
             _cic_label_score).round(3).values
 
 
-def _standardize(df: pd.DataFrame, dayfirst: bool = False) -> pd.DataFrame:
+def _standardize(df: pd.DataFrame, dayfirst: bool = False,
+                 cic: bool = False) -> tuple[pd.DataFrame, list[str]]:
     # Normalized alias lookup so 'Source IP', 'source_ip' and 'SRCIP' match.
     norm_map = {_norm_col(c): c for c in df.columns}
     alias_map: dict[str, str] = {}
@@ -302,12 +303,42 @@ def _standardize(df: pd.DataFrame, dayfirst: bool = False) -> pd.DataFrame:
         if nrm in alias_map:
             mapped[alias_map[nrm]] = df[orig]
     missing = [c for c in ("timestamp", "src_ip", "dst_ip") if c not in mapped]
-    if missing:
+    notes: list[str] = []
+    if not mapped:
         raise DataLoadError(
             "Required traffic features were not detected "
-            f"(missing: {', '.join(missing)}). "
+            "(missing: timestamp, src_ip, dst_ip). "
             "Load the Demo Dataset or upload a supported traffic CSV.")
     out = pd.DataFrame(mapped)
+    n_rows = len(out)
+    if "timestamp" in missing:
+        # No clock in file: rebuild a monotonic clock from capture order so
+        # windowing/forecasting still work. Clearly labelled as synthetic.
+        base = (pd.Timestamp("2017-07-06 08:00:00") if cic
+                else pd.Timestamp("2026-09-23 14:15:00"))
+        span = 4 * 3600 if cic else 3600
+        out["timestamp"] = base + pd.to_timedelta(
+            np.linspace(0, span, n_rows), unit="s")
+        notes.append("Timestamps reconstructed from file row order "
+                     "(source file has no timestamp column).")
+    if "src_ip" in missing or "dst_ip" in missing:
+        # No endpoints in file: deterministic synthetic IDs from the
+        # documentation (TEST-NET) ranges so they are never mistaken
+        # for real infrastructure.
+        lab = df[norm_map["label"]] if "label" in norm_map else None
+        if lab is not None:
+            attack = (lab.astype(str).str.strip().str.lower()
+                      != "benign").values
+        else:
+            attack = np.zeros(n_rows, dtype=bool)
+        pool = (np.arange(n_rows) * 2654435761) % 59 + 2
+        out["src_ip"] = np.where(
+            attack, "203.0.113.7", "192.0.2." + pool.astype(str))
+        out["dst_ip"] = "198.51.100.50"
+        notes.append("Endpoint IPs are synthetic documentation-range IDs "
+                     "(source file has no IP columns): attacks from "
+                     "203.0.113.7, benign hosts from 192.0.2.0/24, "
+                     "server 198.51.100.50.")
     out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce",
                                       dayfirst=dayfirst)
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -343,7 +374,7 @@ def _standardize(df: pd.DataFrame, dayfirst: bool = False) -> pd.DataFrame:
         out["risk_score"] = (0.12 + 0.30 * syn + 0.25 * svc).clip(0, 0.95).round(3)
     out["risk_score"] = pd.to_numeric(out["risk_score"], errors="coerce").fillna(0.1).clip(0, 1)
     out["risk"] = out["risk_score"].apply(severity_for_score)
-    return out[FLOW_COLUMNS]
+    return out[FLOW_COLUMNS], notes
 
 
 def load_uploaded_csv(uploaded_file) -> pd.DataFrame:
@@ -356,7 +387,7 @@ def load_uploaded_csv(uploaded_file) -> pd.DataFrame:
     cols = {_norm_col(c) for c in df.columns}
     cic = {"totalfwdpackets", "totalbackwardpackets"} <= cols
     # CICIDS2017 timestamps use D/M/YYYY ordering.
-    return _standardize(df, dayfirst=cic)
+    return _standardize(df, dayfirst=cic, cic=cic)
 
 
 def load_pcap(uploaded_file) -> pd.DataFrame:
@@ -438,10 +469,11 @@ def load_pcap(uploaded_file) -> pd.DataFrame:
         })
     out = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
     out["risk"] = out["risk_score"].apply(severity_for_score)
-    return out[FLOW_COLUMNS]
+    return out[FLOW_COLUMNS], []
 
 
-def describe_dataset(df: pd.DataFrame, name: str, ftype: str, size: str) -> dict:
+def describe_dataset(df: pd.DataFrame, name: str, ftype: str, size: str,
+                     notes: list[str] | None = None) -> dict:
     return {
         "file_name": name,
         "file_type": ftype,
@@ -450,4 +482,5 @@ def describe_dataset(df: pd.DataFrame, name: str, ftype: str, size: str) -> dict
         "time_start": df["timestamp"].min(),
         "time_end": df["timestamp"].max(),
         "status": "Complete",
+        "notes": notes or [],
     }
