@@ -470,13 +470,40 @@ def page_dashboard() -> None:
                 st.warning(f"⚠ Unable to process the selected file. {exc}")
     with tab_demo:
         st.markdown("Realistic simulated enterprise traffic with a progressive "
-                    "internal attack (12,481 flows, 5 time windows).")
+                    "internal attack (12,481 flows, 5 time windows). "
+                    "CICIDS2017 flow CSVs are also supported.")
         if st.button("📥 Load Demo Dataset", type="primary"):
             run_analysis(load_demo_dataset(), "demo_network.csv", "CSV", "—")
             st.session_state.is_demo = True
             apply_demo_phase(7)
             st.success("Demo dataset loaded.")
             st.rerun()
+        from modules.data_loader import DATA_DIR
+        local_csvs = sorted(
+            p.name for p in DATA_DIR.glob("*.csv")
+            if p.name != "demo_network.csv")
+        if local_csvs:
+            st.markdown("**Or load a CSV already in the `data/` folder** "
+                        "(faster than uploading large captures):")
+            pick = st.selectbox("Local file", local_csvs)
+            if st.button("📂 Load selected file", type="primary"):
+                try:
+                    import os
+                    path = DATA_DIR / pick
+                    with open(path, "r", newline="",
+                              encoding="utf-8", errors="replace") as fh:
+                        df = load_uploaded_csv(fh)
+                    size_mb = path.stat().st_size / (1024 * 1024)
+                    size = (f"{size_mb:.1f} MB" if size_mb >= 1
+                            else f"{path.stat().st_size / 1024:.1f} KB")
+                    run_analysis(df, pick, "CSV", size)
+                    st.session_state.is_demo = False
+                    st.session_state.visible_ids = [
+                        w.id for w in st.session_state.windows]
+                    st.success(f"Processed {len(df):,} records from {pick}.")
+                    st.rerun()
+                except DataLoadError as exc:
+                    st.warning(f"⚠ Unable to process the selected file. {exc}")
 
     info = st.session_state.dataset_info
     if info:

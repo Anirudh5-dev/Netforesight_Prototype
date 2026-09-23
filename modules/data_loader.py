@@ -1,11 +1,21 @@
 """Offline data loading: demo dataset, CSV uploads and optional PCAP parsing.
 
+Supported CSV layouts (auto-detected):
+
+* NetForeSight flow CSV (``timestamp, src_ip, dst_ip, ...``)
+* Generic traffic CSVs via forgiving column aliases
+* CICIDS2017 flow CSVs (e.g. ``Thursday-WorkingHours-...-WebAttacks``):
+  ``Source IP`` / ``Destination IP`` / ``Timestamp`` / ``Destination Port``,
+  ``Flow Duration`` + ``Flow IAT Mean`` in microseconds, ``* Flag Count``
+  columns, packet/byte totals and a ``Label`` column mapped to risk scores.
+
 Everything runs locally. PCAP support needs ``scapy`` (listed in
 requirements.txt); the app works without it by using CSV / demo data.
 """
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import numpy as np
@@ -208,14 +218,89 @@ def load_demo_dataset() -> pd.DataFrame:
 # Uploaded files                                                              #
 # --------------------------------------------------------------------------- #
 
-def _standardize(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    mapped: dict[str, pd.Series] = {}
+def _norm_col(name: object) -> str:
+    """Lowercase alphanumeric fingerprint: 'Source IP' -> 'sourceip'."""
+    return re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
+
+
+def _cic_label_score(label: object) -> float:
+    """Deterministic risk score from a CICIDS2017 attack label."""
+    lab = str(label).strip().lower()
+    if lab == "benign":
+        return 0.10
+    if any(k in lab for k in ("portscan", "patator")):
+        return 0.68
+    if any(k in lab for k in ("heartbleed", "infiltration", "bot", "dos",
+                              "ddos", "hulk", "goldeneye", "slowloris",
+                              "slowhttptest", "sql", "xss", "brute force",
+                              "web attack")):
+        return 0.85
+    return 0.75  # any other non-benign label
+
+
+def _apply_cicids_mapping(out: pd.DataFrame, raw: pd.DataFrame,
+                          norm_map: dict[str, object]) -> None:
+    """Fill NetForeSight fields from CICIDS2017 composite columns (in place).
+
+    Runs only when the CIC fingerprint (fwd/bwd packet totals) is present.
+    Durations and IATs are converted from microseconds to seconds, TCP
+    flags are composed from ``* Flag Count`` columns and risk scores come
+    from the ``Label`` column unless explicit scores already exist.
+    """
+    def _get(*names):
+        for n in names:
+            if n in norm_map:
+                return pd.to_numeric(raw[norm_map[n]], errors="coerce")
+        return None
+
+    fwd_pkts = _get("totalfwdpackets")
+    bwd_pkts = _get("totalbackwardpackets")
+    if fwd_pkts is None or bwd_pkts is None:
+        return  # not a CICIDS2017 layout
+    out["packets"] = (fwd_pkts.fillna(0) + bwd_pkts.fillna(0)
+                      ).astype(int).clip(lower=1).values
+    fwd_b = _get("totallengthoffwdpackets")
+    bwd_b = _get("totallengthofbwdpackets")
+    if fwd_b is not None and bwd_b is not None:
+        out["bytes"] = (fwd_b.fillna(0) + bwd_b.fillna(0)
+                        ).astype(int).clip(lower=1).values
+    dur = _get("flowduration")
+    if dur is not None:
+        out["duration"] = (dur.fillna(1000) / 1e6).clip(lower=0.01).values
+    iat = _get("flowiatmean")
+    if iat is not None:
+        out["iat_mean"] = (iat.fillna(500000) / 1e6).clip(lower=0.001).values
+
+    flag_order = [("synflagcount", "SYN"), ("ackflagcount", "ACK"),
+                  ("finflagcount", "FIN"), ("rstflagcount", "RST"),
+                  ("pshflagcount", "PSH"), ("urgflagcount", "URG")]
+    flag_cols = [(raw[norm_map[n]], tag) for n, tag in flag_order
+                 if n in norm_map]
+    if flag_cols:
+        mat = np.column_stack([
+            pd.to_numeric(c, errors="coerce").fillna(0).values > 0
+            for c, _ in flag_cols])
+        tags = [tag for _, tag in flag_cols]
+        out["tcp_flags"] = [
+            "-".join(t for t, on in zip(tags, row) if on) or "ACK"
+            for row in mat]
+
+    if "risk_score" not in out and "label" in norm_map:
+        out["risk_score"] = raw[norm_map["label"]].apply(
+            _cic_label_score).round(3).values
+
+
+def _standardize(df: pd.DataFrame, dayfirst: bool = False) -> pd.DataFrame:
+    # Normalized alias lookup so 'Source IP', 'source_ip' and 'SRCIP' match.
+    norm_map = {_norm_col(c): c for c in df.columns}
+    alias_map: dict[str, str] = {}
     for canonical, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
-            if alias in cols:
-                mapped[canonical] = df[cols[alias]]
-                break
+            alias_map.setdefault(_norm_col(alias), canonical)
+    mapped: dict[str, pd.Series] = {}
+    for nrm, orig in norm_map.items():
+        if nrm in alias_map:
+            mapped[alias_map[nrm]] = df[orig]
     missing = [c for c in ("timestamp", "src_ip", "dst_ip") if c not in mapped]
     if missing:
         raise DataLoadError(
@@ -223,22 +308,35 @@ def _standardize(df: pd.DataFrame) -> pd.DataFrame:
             f"(missing: {', '.join(missing)}). "
             "Load the Demo Dataset or upload a supported traffic CSV.")
     out = pd.DataFrame(mapped)
-    n = len(out)
-    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce",
+                                      dayfirst=dayfirst)
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     if out.empty:
         raise DataLoadError("No valid timestamped records found in the file.")
-    out["src_port"] = pd.to_numeric(out.get("src_port"), errors="coerce").fillna(0).astype(int)
-    out["dst_port"] = pd.to_numeric(out.get("dst_port"), errors="coerce").fillna(0).astype(int)
-    out["protocol"] = out.get("protocol", "TCP").fillna("TCP").astype(str).str.upper()
-    out["tcp_flags"] = out.get("tcp_flags", "ACK").fillna("ACK").astype(str).str.upper()
-    out["packets"] = pd.to_numeric(out.get("packets"), errors="coerce").fillna(1).astype(int).clip(lower=1)
-    out["bytes"] = pd.to_numeric(out.get("bytes"), errors="coerce").fillna(64).astype(int).clip(lower=1)
-    out["duration"] = pd.to_numeric(out.get("duration"), errors="coerce").fillna(0.1).clip(lower=0.01)
-    out["iat_mean"] = pd.to_numeric(out.get("iat_mean"), errors="coerce").fillna(0.5).clip(lower=0.001)
-    out["ttl"] = pd.to_numeric(out.get("ttl"), errors="coerce").fillna(64).astype(int).clip(1, 255)
+    for col in ("src_ip", "dst_ip"):
+        out[col] = out[col].astype(str).str.strip()
+    # CICIDS2017 composite fields (microsecond units, flag counts, labels).
+    _apply_cicids_mapping(out, df, norm_map)
+    def _col(name: str, default):
+        if name in out.columns:
+            return out[name]
+        return pd.Series(default, index=out.index)
+
+    out["src_port"] = pd.to_numeric(_col("src_port", 0), errors="coerce").fillna(0).astype(int)
+    out["dst_port"] = pd.to_numeric(_col("dst_port", 0), errors="coerce").fillna(0).astype(int)
+    if "protocol" in out.columns:
+        out["protocol"] = out["protocol"].fillna("TCP").astype(str).str.upper().str.strip()
+    else:  # CICIDS2017 has no protocol column: infer from service ports.
+        out["protocol"] = np.where(out["dst_port"].isin([53, 123, 161, 1900, 5353]),
+                                   "UDP", "TCP")
+    out["tcp_flags"] = _col("tcp_flags", "ACK").fillna("ACK").astype(str).str.upper().str.strip()
+    out["packets"] = pd.to_numeric(_col("packets", 1), errors="coerce").fillna(1).astype(int).clip(lower=1)
+    out["bytes"] = pd.to_numeric(_col("bytes", 64), errors="coerce").fillna(64).astype(int).clip(lower=1)
+    out["duration"] = pd.to_numeric(_col("duration", 0.1), errors="coerce").fillna(0.1).clip(lower=0.01)
+    out["iat_mean"] = pd.to_numeric(_col("iat_mean", 0.5), errors="coerce").fillna(0.5).clip(lower=0.001)
+    out["ttl"] = pd.to_numeric(_col("ttl", 64), errors="coerce").fillna(64).astype(int).clip(1, 255)
     out["retransmissions"] = pd.to_numeric(
-        out.get("retransmissions"), errors="coerce").fillna(0).astype(int).clip(lower=0)
+        _col("retransmissions", 0), errors="coerce").fillna(0).astype(int).clip(lower=0)
     if "risk_score" not in out:
         syn = out["tcp_flags"].str.contains("SYN", na=False).astype(float)
         svc = out["dst_port"].isin([22, 135, 139, 445, 3389, 5985]).astype(float)
@@ -255,7 +353,10 @@ def load_uploaded_csv(uploaded_file) -> pd.DataFrame:
         raise DataLoadError(f"Unable to read the CSV file: {exc}")
     if df.empty:
         raise DataLoadError("The uploaded CSV is empty.")
-    return _standardize(df)
+    cols = {_norm_col(c) for c in df.columns}
+    cic = {"totalfwdpackets", "totalbackwardpackets"} <= cols
+    # CICIDS2017 timestamps use D/M/YYYY ordering.
+    return _standardize(df, dayfirst=cic)
 
 
 def load_pcap(uploaded_file) -> pd.DataFrame:
